@@ -36,8 +36,9 @@ enum Token {
     // control
     tok_if = -6,
     tok_then = -7,
-    tok_else = -8,
-
+    tok_else = -8,    
+    tok_for = -9,
+    tok_in = -10,
 };
 
 static std::string IdentifierStr;
@@ -69,6 +70,10 @@ static int gettoken() {
             return tok_then;
         } else if (IdentifierStr == "else") {
             return tok_else;
+        }else if (IdentifierStr == "for") {
+            return tok_for;
+        } else if (IdentifierStr == "in") {
+            return tok_in;
         }
 
         return tok_identifier;
@@ -160,6 +165,20 @@ public:
               std::unique_ptr<ExprAST> Else)
         : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
     Value* codegen() override;
+};
+
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start, End, Step, Body;
+
+public:
+  ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
+             std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step,
+             std::unique_ptr<ExprAST> Body)
+    : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+      Step(std::move(Step)), Body(std::move(Body)) {}
+
+  Value* codegen() override;
 };
 
 class PrototypeAST {
@@ -284,6 +303,45 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
     return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
 }
 
+// forexpr ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
+static std::unique_ptr<ExprAST> ParseForExpr() {
+    getNextToken();  // eat the for
+
+    if (CurTok != tok_identifier) return LogError("expected identifier after for");
+
+    std::string IdName = IdentifierStr;
+    getNextToken();  // eat identifier
+
+    if (CurTok != '=') return LogError("expected '=' after for");
+    getNextToken();  // eat '='
+
+    auto Start = ParseExpression();
+    if (!Start) return nullptr;
+    if (CurTok != ',') return LogError("expected ',' after for start value");
+    getNextToken();
+
+    auto End = ParseExpression();
+    if (!End) return nullptr;
+
+    // the step value is optional.
+    std::unique_ptr<ExprAST> Step;
+    if (CurTok == ',') {
+        getNextToken();
+        Step = ParseExpression();
+        if (!Step) return nullptr;
+    }
+
+    if (CurTok != tok_in) return LogError("expected 'in' after for");
+    getNextToken();  // eat 'in'
+
+    auto Body = ParseExpression();
+    if (!Body) return nullptr;
+
+    return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End), 
+                                                std::move(Step),  std::move(Body));
+    }
+
+
 static std::unique_ptr<ExprAST> ParsePrimary() {
     switch (CurTok) {
         case tok_identifier:
@@ -294,6 +352,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
             return ParseParenExpr();
         case tok_if:
             return ParseIfExpr();
+        case tok_for:
+            return ParseForExpr();
         default: 
             return LogError("unknown token when expecting an expression");
     }
@@ -505,6 +565,90 @@ Value *IfExprAST::codegen() {
     PN->addIncoming(ThenV, ThenBB);
     PN->addIncoming(ElseV, ElseBB);
     return PN;
+}
+
+/* Output for-loop as:
+ *   ...
+ *  start = startexpr
+ *   goto loop
+ * loop:
+ *   variable = phi [start, loopheader], [nextvariable, loopend]
+ *   ...
+ *   bodyexpr
+ *   ...
+ * loopend:
+ *   step = stepexpr
+ *   nextvariable = variable + step
+ *   endcond = endexpr
+ *   br endcond, loop, endloop
+ * outloop: 
+ */
+Value* ForExprAST::codegen() {
+    // emit the start code first, without 'variable' in scope.
+    Value *StartVal = Start->codegen();
+    if (!StartVal) return nullptr;
+
+    // make the new basic block for the loop header, inserting after current block
+    Function *TheFunction = Builder->GetInsertBlock()->getParent();
+    BasicBlock *PreheaderBB = Builder->GetInsertBlock();
+    BasicBlock *LoopBB = BasicBlock::Create(*TheContext, "loop", TheFunction);
+
+    // insert an explicit fall through from the current block to the LoopBB.
+    Builder->CreateBr(LoopBB);
+
+    // start insertion in LoopBB.
+    Builder->SetInsertPoint(LoopBB);
+
+    // start the PHI node with an entry for Start.
+    PHINode *Variable = Builder->CreatePHI(Type::getDoubleTy(*TheContext), 2, VarName);
+    Variable->addIncoming(StartVal, PreheaderBB);
+
+    // within the loop, the variable is defined equal to the PHI node 
+    // if it shadows an existing variable, we have to restore it, so save it now.
+    Value *OldVal = NameValues[VarName];
+    NameValues[VarName] = Variable;
+
+    // emit the body of the loop
+    if (!Body->codegen()) return nullptr;
+
+    // emit the step value.
+    Value *StepVal = nullptr;
+    if (Step) {
+        StepVal = Step->codegen();
+        if (!StepVal) return nullptr;
+    } else {
+        // if not specified, use 1.0.
+        StepVal = ConstantFP::get(*TheContext, APFloat(1.0));
+    }
+
+    Value* NextVar = Builder->CreateFAdd(Variable, StepVal, "nextvar");
+
+    // compute the end condition.
+    Value* EndCond = End->codegen();
+    if (!EndCond) return nullptr;
+
+    // convert condition to a bool by comparing non-equal to 0.0.
+    EndCond = Builder->CreateFCmpONE(EndCond, ConstantFP::get(*TheContext, APFloat(0.0)), "loopcond");
+
+    // create the "after loop" block and insert it.
+    BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+    BasicBlock *AfterBB = BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+    // insert the conditional branch into the end of LoopEndBB.
+    Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+
+    // new code will be inserted in AfterBB.
+    Builder->SetInsertPoint(AfterBB);
+
+    // add a new entry to the PHI node for the backedge.
+    Variable->addIncoming(NextVar, LoopEndBB);
+
+    // restore the unshadowed variable.
+    if (OldVal) NameValues[VarName] = OldVal;
+    else NameValues.erase(VarName);
+
+    // for expr always returns 0.0.
+    return Constant::getNullValue(Type::getDoubleTy(*TheContext));
 }
 
 
